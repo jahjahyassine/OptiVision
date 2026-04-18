@@ -1,0 +1,4 @@
+image,actual,predicted,correct
+dataset/test_faces/Ronaldo/ronaldo.png,Ronaldo,Ronaldo,True
+dataset/test_faces/Neymar/neymar.png,Neymar,Unknown,False
+dataset/test_faces/Messi/messi.png,Messi,Messi,True

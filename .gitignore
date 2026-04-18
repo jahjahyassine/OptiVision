@@ -1,0 +1,47 @@
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# -----------------------------
+# Virtual environments
+# -----------------------------
+venv/
+.env/
+
+# -----------------------------
+# Database (IMPORTANT)
+# -----------------------------
+database/face_embeddings/*.db
+
+# -----------------------------
+# AI Models (VERY HEAVY)
+# -----------------------------
+backend/ai_modules/**/models/**/*.onnx
+backend/ai_modules/**/models/**/*.zip
+
+
+# If you WANT small test data, comment above and use:
+# dataset/*
+# !dataset/test_faces/
+
+
+# -----------------------------
+# Logs
+# -----------------------------
+*.log
+
+# -----------------------------
+# OS files
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Docker
+# -----------------------------
+*.env
+docker-compose.override.yml

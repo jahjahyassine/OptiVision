@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Face Recognition Module — Python Dependencies
+# VisionAssist · AI Assistive Vision System
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# GPU install (recommended):
+#   pip install -r requirements_face.txt
+#
+# CPU-only (no CUDA):
+#   Swap onnxruntime-gpu → onnxruntime in the line below, then:
+#   pip install -r requirements_face.txt
+#
+# Python: 3.9 – 3.11  (3.12 not fully tested with insightface)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core face recognition ──────────────────────────────────────────────────
+insightface>=0.7.3
+onnxruntime-gpu>=1.16.0      # swap for onnxruntime if no CUDA
+
+# ── Vision / image processing ─────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9      # required for FastAPI file uploads
+
+# ── Testing ───────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0                # FastAPI TestClient dependency
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. InsightFace downloads weights on first run:
+#    buffalo_l  → ~300 MB  (most accurate — RECOMMENDED)
+#    buffalo_sc → ~30 MB   (fast, good for CPU/limited resources)
+#    Stored at ~/.insightface/ by default.
+#
+# 2. NVIDIA GPU: make sure CUDA + cuDNN match your onnxruntime-gpu version.
+#    https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html
+#
+# 3. Arch Linux (your setup):
+#    yay -S cuda cudnn
+#    pip install onnxruntime-gpu
+#
+# 4. "libGL.so.1 not found" on headless servers:
+#    pip install opencv-python-headless  (instead of opencv-python)
+# ─────────────────────────────────────────────────────────────────────────────
