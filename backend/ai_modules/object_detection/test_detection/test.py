@@ -41,4 +41,4 @@ def test_image(image_path: str):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    test_image(r"C:\Users\uaser\Desktop\Cavour (@cavour_co) • Instagram photos and videos.jpg")
+    test_image(r"/home/yassine/Projects/OptiVision/dataset/objects/horse&car.png")

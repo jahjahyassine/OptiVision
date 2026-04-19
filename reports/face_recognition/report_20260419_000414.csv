@@ -1,0 +1,4 @@
+image,actual,predicted,confidence,faces_found,correct
+dataset/test_faces/Messi/messi.png,Messi,Messi,0.8173,1,True
+dataset/test_faces/Neymar/neymar.png,Neymar,Unknown,0.0000,1,False
+dataset/test_faces/Ronaldo/ronaldo.png,Ronaldo,Ronaldo,0.5546,1,True
