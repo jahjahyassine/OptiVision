@@ -37,11 +37,20 @@ class ConnectionManager:
 
     One instance is created at app startup and shared across all endpoints.
     Thread-safe for reads; dict mutations happen only in the async event loop.
+
+    Parameters
+    ----------
+    frame_queue :
+        Shared FrameQueue where decoded frames are enqueued.
+    dashboard_manager :
+        Optional DashboardManager for broadcast-to-dashboard support.
+        If provided, inference results can be relayed to the browser dashboard.
     """
 
-    def __init__(self, frame_queue: FrameQueue) -> None:
+    def __init__(self, frame_queue: FrameQueue, dashboard_manager=None) -> None:
         self._active: Dict[str, WebSocket] = {}
         self._frame_queue = frame_queue
+        self._dashboard_manager = dashboard_manager
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -82,24 +91,43 @@ class ConnectionManager:
         Continuously receive messages from one camera and push decoded frames
         to the shared FrameQueue.
 
-        Handles both text (base64/JSON) and binary (raw JPEG) messages.
+        Supports both text messages (JSON or base64) and binary (raw JPEG) messages.
         """
         frames_received = 0
         frames_dropped  = 0
 
-        async for message in websocket.iter_bytes():
-            # Binary path: raw JPEG bytes
-            frame = _decode_binary_frame(message)
-            if frame is not None:
-                dropped = self._frame_queue.put(frame)
-                if dropped:
-                    frames_dropped += 1
-                frames_received += 1
-                if frames_received % 100 == 0:
-                    logger.debug(
-                        "Camera '%s': %d frames received, %d dropped",
-                        camera_id, frames_received, frames_dropped,
-                    )
+        while True:
+            try:
+                # Receive either text or binary message
+                data = await websocket.receive()
+
+                if "bytes" in data:
+                    # Binary message: raw JPEG bytes
+                    message = data["bytes"]
+                    frame = _decode_binary_frame(message)
+                elif "text" in data:
+                    # Text message: JSON or base64
+                    message = data["text"]
+                    frame = _decode_text_frame(message)
+                else:
+                    # Unknown message type
+                    continue
+
+                if frame is not None:
+                    dropped = self._frame_queue.put(frame)
+                    if dropped:
+                        frames_dropped += 1
+                    frames_received += 1
+                    if frames_received % 100 == 0:
+                        logger.debug(
+                            "Camera '%s': %d frames received, %d dropped",
+                            camera_id, frames_received, frames_dropped,
+                        )
+            except WebSocketDisconnect:
+                raise
+            except Exception as exc:
+                logger.error("Receive error for camera '%s': %s", camera_id, exc, exc_info=True)
+                break
 
     async def _receive_text_loop(self, camera_id: str, websocket: WebSocket) -> None:
         """

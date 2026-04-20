@@ -42,6 +42,9 @@ try:
         FRAME_MAX_WIDTH: int   = 640
         FRAME_MAX_HEIGHT: int  = 480
 
+        # Inference timing (real-time control)
+        INFERENCE_TIMEOUT_MS: int = 30
+
         # Face Recognition
         FACE_MODEL: str                  = "buffalo_l"
         FACE_CTX_ID: int                 = 0
@@ -72,6 +75,11 @@ try:
         # Decision Engine
         DECISION_CONFIDENCE_THRESHOLD: float = 0.5
         DECISION_IDENTITY_PRIORITY: bool     = True
+
+        # Performance / real-time constraints
+        MAX_INFERENCE_LATENCY_MS: int = 150
+        ENABLE_REALTIME_DROPPING: bool = True
+
 
         # Audio / TTS
         TTS_ENGINE: str             = "google"

@@ -39,8 +39,11 @@ from backend.core.config import settings
 from backend.core.frame_queue import FrameQueue
 from backend.core.worker_pool import WorkerPool
 from backend.communication.websocket_server.websocket_server import ConnectionManager
+from backend.communication.dashboard_manager import DashboardManager
 from backend.services.inference_service import build_inference_service
 from backend.fusion_engine.decision_engine import DecisionEngine
+from backend.fusion_engine.state_manager import StateManager
+from backend.audio.audio_factory import build_audio_priority_queue
 from backend.api.routes.faces import router as faces_router
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -52,10 +55,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── global singletons (initialised inside lifespan) ───────────────────────────
-frame_queue:        FrameQueue | None       = None
-worker_pool:        WorkerPool | None       = None
+frame_queue:        FrameQueue | None        = None
+worker_pool:        WorkerPool | None        = None
 connection_manager: ConnectionManager | None = None
-decision_engine:    DecisionEngine | None   = None
+dashboard_manager:  DashboardManager | None  = None
+decision_engine:    DecisionEngine | None    = None
+audio_queue:        object | None            = None  # AudioPriorityQueue
+state_manager:      StateManager | None      = None
 
 
 # ── lifespan ──────────────────────────────────────────────────────────────────
@@ -63,24 +69,59 @@ decision_engine:    DecisionEngine | None   = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Boot all heavy components before accepting requests; tear down cleanly."""
-    global frame_queue, worker_pool, connection_manager, decision_engine
+    global frame_queue, worker_pool, connection_manager, dashboard_manager, decision_engine, audio_queue, state_manager
 
     logger.info("OptiVision startup …")
 
     # 1. Build AI pipeline
     inference_service = build_inference_service()
-    decision_engine   = DecisionEngine(
+
+    # 2. State manager for persistence tracking (used by audio queue)
+    state_manager = StateManager()
+
+    # 3. Decision engine (converts inference results → actionable decisions)
+    decision_engine = DecisionEngine(
         confidence_threshold=settings.DECISION_CONFIDENCE_THRESHOLD,
         identity_priority=settings.DECISION_IDENTITY_PRIORITY,
     )
 
-    # 2. Frame queue (thread-safe, bounded)
+    # 4. Audio system (TTS + priority queue for alerts)
+    audio_queue = build_audio_priority_queue(state_manager=state_manager)
+    audio_queue.start()
+
+    # 5. Dashboard manager (broadcasts results to browser clients)
+    dashboard_manager = DashboardManager()
+
+    # 6. Frame queue (thread-safe, bounded)
     frame_queue = FrameQueue(maxsize=settings.FRAME_QUEUE_SIZE)
 
-    # 3. Worker pool — each worker: get frame → infer → decide → log/TTS
+    # 7. Worker pool — each worker: get frame → infer → decide → broadcast → TTS
     def _on_result(raw: dict) -> None:
+        """
+        Callback from worker thread after inference completes.
+        Chain: inference → decision → audio/dashboard broadcast.
+        """
+        import asyncio
+
+        # Convert raw inference dict → decision
         decision = decision_engine.decide(raw)
-        logger.info("Decision: [%s] %s", decision["priority"], decision["primary_label"])
+        logger.info(
+            "Decision [score=%d] '%s'",
+            decision["priority_score"], decision["alert_text"]
+        )
+
+        # Chain inference result → decision → audio queue
+        audio_queue.enqueue(decision)
+
+        # Broadcast to dashboard (async, non-blocking)
+        # We schedule this in the event loop to avoid blocking the worker thread
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(dashboard_manager.broadcast_inference(raw))
+            loop.run_until_complete(dashboard_manager.broadcast_decision(decision))
+        except Exception as exc:
+            logger.warning("Dashboard broadcast failed: %s", exc)
 
     worker_pool = WorkerPool(
         frame_queue=frame_queue,
@@ -90,8 +131,8 @@ async def lifespan(app: FastAPI):
     )
     worker_pool.start()
 
-    # 4. WebSocket connection manager
-    connection_manager = ConnectionManager(frame_queue=frame_queue)
+    # 8. WebSocket connection manager (receives frames from cameras)
+    connection_manager = ConnectionManager(frame_queue=frame_queue, dashboard_manager=dashboard_manager)
 
     logger.info("OptiVision ready — listening for cameras.")
     yield  # ← application runs here
@@ -100,6 +141,10 @@ async def lifespan(app: FastAPI):
     logger.info("OptiVision shutting down …")
     if worker_pool:
         worker_pool.stop()
+    if audio_queue:
+        audio_queue.stop()
+    if inference_service:
+        inference_service.shutdown()
     logger.info("Shutdown complete.")
 
 
@@ -136,6 +181,24 @@ async def camera_endpoint(websocket: WebSocket, camera_id: str):
         await websocket.close(code=1011, reason="Server not ready")
         return
     await connection_manager.handle(camera_id, websocket)
+
+
+@app.websocket("/ws/dashboard")
+async def dashboard_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for browser-based dashboard monitoring.
+
+    Clients connect here to receive real-time updates:
+    - Inference results (faces, objects, OCR, depth)
+    - Decisions (priority, alert text, confidence)
+    - System statistics
+
+    Messages sent to this endpoint are reflected back (heartbeat mechanism).
+    """
+    if dashboard_manager is None:
+        await websocket.close(code=1011, reason="Server not ready")
+        return
+    await dashboard_manager.handle(websocket)
 
 
 # ── REST API routes ───────────────────────────────────────────────────────────
