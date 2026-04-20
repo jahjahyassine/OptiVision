@@ -18,10 +18,12 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, WebSocket
@@ -62,6 +64,8 @@ dashboard_manager:  DashboardManager | None  = None
 decision_engine:    DecisionEngine | None    = None
 audio_queue:        object | None            = None  # AudioPriorityQueue
 state_manager:      StateManager | None      = None
+_broadcast_queue:   Optional[asyncio.Queue] = None  # Thread-safe broadcast queue
+_event_loop:        Optional[asyncio.AbstractEventLoop] = None  # Main app event loop
 
 
 # ── lifespan ──────────────────────────────────────────────────────────────────
@@ -69,9 +73,13 @@ state_manager:      StateManager | None      = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Boot all heavy components before accepting requests; tear down cleanly."""
-    global frame_queue, worker_pool, connection_manager, dashboard_manager, decision_engine, audio_queue, state_manager
+    global frame_queue, worker_pool, connection_manager, dashboard_manager, decision_engine, audio_queue, state_manager, _broadcast_queue, _event_loop
 
     logger.info("OptiVision startup …")
+
+    # Store reference to the main event loop for thread-safe operations
+    _event_loop = asyncio.get_event_loop()
+    _broadcast_queue = asyncio.Queue(maxsize=100)
 
     # 1. Build AI pipeline
     inference_service = build_inference_service()
@@ -95,33 +103,62 @@ async def lifespan(app: FastAPI):
     # 6. Frame queue (thread-safe, bounded)
     frame_queue = FrameQueue(maxsize=settings.FRAME_QUEUE_SIZE)
 
-    # 7. Worker pool — each worker: get frame → infer → decide → broadcast → TTS
+    # 7. Background task to drain broadcast queue (runs in asyncio event loop)
+    async def _broadcast_worker() -> None:
+        """
+        Drains the broadcast queue and sends messages to dashboard.
+        Runs continuously in the asyncio event loop.
+        """
+        while True:
+            try:
+                msg = await asyncio.wait_for(_broadcast_queue.get(), timeout=1.0)
+                if msg is None:  # Sentinel value for shutdown
+                    break
+                msg_type, payload = msg
+                try:
+                    if msg_type == "inference":
+                        await dashboard_manager.broadcast_inference(payload)
+                    elif msg_type == "decision":
+                        await dashboard_manager.broadcast_decision(payload)
+                except Exception as exc:
+                    logger.warning("Dashboard broadcast (%s) failed: %s", msg_type, exc)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as exc:
+                logger.error("Broadcast worker error: %s", exc, exc_info=True)
+                break
+
+    # Create broadcast worker task
+    broadcast_task = asyncio.create_task(_broadcast_worker())
+
+    # 8. Worker pool — each worker: get frame → infer → decide → queue broadcast → audio
     def _on_result(raw: dict) -> None:
         """
         Callback from worker thread after inference completes.
-        Chain: inference → decision → audio/dashboard broadcast.
+        Chain: inference → decision → audio + async broadcast (non-blocking).
+        
+        Uses asyncio.run_coroutine_threadsafe() to safely notify the event loop
+        from worker threads WITHOUT creating new event loops.
         """
-        import asyncio
-
         # Convert raw inference dict → decision
         decision = decision_engine.decide(raw)
-        logger.info(
+        logger.debug(
             "Decision [score=%d] '%s'",
             decision["priority_score"], decision["alert_text"]
         )
 
-        # Chain inference result → decision → audio queue
+        # Enqueue to audio system (thread-safe, fast, non-blocking)
         audio_queue.enqueue(decision)
 
-        # Broadcast to dashboard (async, non-blocking)
-        # We schedule this in the event loop to avoid blocking the worker thread
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(dashboard_manager.broadcast_inference(raw))
-            loop.run_until_complete(dashboard_manager.broadcast_decision(decision))
-        except Exception as exc:
-            logger.warning("Dashboard broadcast failed: %s", exc)
+        # Queue broadcast messages for async processing
+        # This is thread-safe and non-blocking — just appends to queue
+        if _event_loop and _broadcast_queue:
+            try:
+                # Use put_nowait to avoid blocking the worker thread
+                _broadcast_queue.put_nowait(("inference", raw))
+                _broadcast_queue.put_nowait(("decision", decision))
+            except asyncio.QueueFull:
+                logger.debug("Broadcast queue full — dropping oldest message")
 
     worker_pool = WorkerPool(
         frame_queue=frame_queue,
@@ -131,11 +168,11 @@ async def lifespan(app: FastAPI):
     )
     worker_pool.start()
 
-    # 8. WebSocket connection manager (receives frames from cameras)
+    # 9. WebSocket connection manager (receives frames from cameras)
     connection_manager = ConnectionManager(frame_queue=frame_queue, dashboard_manager=dashboard_manager)
 
     logger.info("OptiVision ready — listening for cameras.")
-    yield  # ← application runs here
+    yield  # ← application runs here (broadcast_task continues running)
 
     # ── shutdown ──────────────────────────────────────────────────────────────
     logger.info("OptiVision shutting down …")
@@ -145,6 +182,22 @@ async def lifespan(app: FastAPI):
         audio_queue.stop()
     if inference_service:
         inference_service.shutdown()
+    
+    # Signal broadcast worker to stop
+    if _broadcast_queue:
+        try:
+            _broadcast_queue.put_nowait(None)  # Sentinel
+        except asyncio.QueueFull:
+            pass
+    
+    # Wait for broadcast task to finish
+    if broadcast_task:
+        try:
+            await asyncio.wait_for(broadcast_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("Broadcast worker did not exit within timeout")
+            broadcast_task.cancel()
+    
     logger.info("Shutdown complete.")
 
 
@@ -208,11 +261,51 @@ app.include_router(faces_router, prefix="/api/faces", tags=["Face Recognition"])
 
 @app.get("/health", tags=["System"])
 async def health():
-    """Liveness probe."""
+    """System health check — returns detailed component status."""
+    import time
+    
+    # Check each component
+    frame_queue_stats = frame_queue.stats if frame_queue else {}
+    active_cameras = len(connection_manager._active) if connection_manager else 0
+    audio_queue_size = audio_queue.qsize if hasattr(audio_queue, 'qsize') and audio_queue else 0
+    worker_running = worker_pool.is_running if worker_pool else False
+    
+    # Determine overall health
+    all_ok = (
+        frame_queue is not None and
+        worker_pool is not None and
+        connection_manager is not None and
+        worker_running and
+        audio_queue is not None
+    )
+    
     return {
-        "status":         "ok",
-        "queue_size":     frame_queue.qsize() if frame_queue else 0,
-        "active_cameras": len(connection_manager._active) if connection_manager else 0,
+        "status":          "ok" if all_ok else "degraded",
+        "timestamp":       time.time(),
+        "components": {
+            "frame_queue": {
+                "ready": frame_queue is not None,
+                "size": frame_queue_stats.get("size", 0),
+                "total_received": frame_queue_stats.get("total_received", 0),
+                "total_dropped": frame_queue_stats.get("total_dropped", 0),
+                "drop_rate": frame_queue_stats.get("drop_rate", 0.0),
+            },
+            "worker_pool": {
+                "ready": worker_pool is not None,
+                "running": worker_running,
+                "workers": settings.N_WORKERS,
+            },
+            "decision_engine": {
+                "ready": decision_engine is not None,
+            },
+            "audio_queue": {
+                "ready": audio_queue is not None,
+                "pending": audio_queue_size,
+            },
+            "websocket": {
+                "active_cameras": active_cameras,
+            },
+        },
     }
 
 

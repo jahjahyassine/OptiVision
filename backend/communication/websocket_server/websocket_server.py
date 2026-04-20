@@ -17,6 +17,7 @@ The handler NEVER blocks the event loop:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -51,6 +52,8 @@ class ConnectionManager:
         self._active: Dict[str, WebSocket] = {}
         self._frame_queue = frame_queue
         self._dashboard_manager = dashboard_manager
+        # Per-camera statistics for monitoring
+        self._camera_stats: Dict[str, dict] = {}
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -78,13 +81,26 @@ class ConnectionManager:
     async def _connect(self, camera_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
         self._active[camera_id] = websocket
+        # Initialize per-camera statistics
+        self._camera_stats[camera_id] = {
+            "frames_received": 0,
+            "frames_dropped": 0,
+            "decode_errors": 0,
+        }
         logger.info("Camera connected: '%s'  (total=%d)", camera_id, self.active_count)
         # Acknowledge connection
         await websocket.send_json({"status": "connected", "camera_id": camera_id})
 
     def _disconnect(self, camera_id: str) -> None:
+        old_stats = self._camera_stats.pop(camera_id, {})
         self._active.pop(camera_id, None)
-        logger.info("Camera removed: '%s'  (total=%d)", camera_id, self.active_count)
+        if old_stats.get("decode_errors", 0) > 0:
+            logger.warning(
+                "Camera '%s' disconnected (total decode errors: %d)",
+                camera_id, old_stats.get("decode_errors", 0)
+            )
+        else:
+            logger.info("Camera removed: '%s'  (total=%d)", camera_id, self.active_count)
 
     async def _receive_loop(self, camera_id: str, websocket: WebSocket) -> None:
         """
@@ -92,14 +108,18 @@ class ConnectionManager:
         to the shared FrameQueue.
 
         Supports both text messages (JSON or base64) and binary (raw JPEG) messages.
+        Tracks frame quality metrics and reports high error rates back to camera.
         """
-        frames_received = 0
-        frames_dropped  = 0
-
+        stats = self._camera_stats.get(camera_id, {})
+        
         while True:
             try:
-                # Receive either text or binary message
-                data = await websocket.receive()
+                # Receive either text or binary message with timeout
+                try:
+                    data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.debug("Camera '%s' receive timeout", camera_id)
+                    break
 
                 if "bytes" in data:
                     # Binary message: raw JPEG bytes
@@ -113,16 +133,43 @@ class ConnectionManager:
                     # Unknown message type
                     continue
 
+                stats["frames_received"] = stats.get("frames_received", 0) + 1
+
                 if frame is not None:
                     dropped = self._frame_queue.put(frame)
                     if dropped:
-                        frames_dropped += 1
-                    frames_received += 1
-                    if frames_received % 100 == 0:
-                        logger.debug(
-                            "Camera '%s': %d frames received, %d dropped",
-                            camera_id, frames_received, frames_dropped,
+                        stats["frames_dropped"] = stats.get("frames_dropped", 0) + 1
+                else:
+                    # Frame decode failed
+                    stats["decode_errors"] = stats.get("decode_errors", 0) + 1
+                    logger.debug(
+                        "Camera '%s': decode error (total errors: %d)",
+                        camera_id, stats["decode_errors"]
+                    )
+                    # Send error feedback to camera
+                    try:
+                        await websocket.send_json({
+                            "status": "decode_error",
+                            "error_count": stats["decode_errors"],
+                            "message": "Framework decode failure — check frame format"
+                        })
+                    except Exception as exc:
+                        logger.debug("Could not send error feedback to camera: %s", exc)
+
+                # Periodic status reporting
+                if stats["frames_received"] % 300 == 0:
+                    error_rate = (stats["decode_errors"] / stats["frames_received"]) if stats["frames_received"] > 0 else 0.0
+                    drop_rate = (stats["frames_dropped"] / stats["frames_received"]) if stats["frames_received"] > 0 else 0.0
+                    logger.info(
+                        "Camera '%s': %d frames received, %.1f%% decode errors, %.1f%% dropped",
+                        camera_id, stats["frames_received"], error_rate * 100, drop_rate * 100
+                    )
+                    if error_rate > 0.1:  # More than 10% error rate
+                        logger.warning(
+                            "Camera '%s' has high decode error rate (%.1f%%) — check network/frame quality",
+                            camera_id, error_rate * 100
                         )
+
             except WebSocketDisconnect:
                 raise
             except Exception as exc:

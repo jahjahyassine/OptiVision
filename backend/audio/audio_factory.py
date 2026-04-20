@@ -22,7 +22,7 @@ def build_tts_engine():
     Build a TTS engine based on configuration.
 
     Returns a TTS engine instance with a .speak(text, interrupt_event) method.
-    Falls back gracefully if dependencies are missing.
+    Raises RuntimeError if dependencies are missing (rather than silently failing).
     """
     tts_engine_name = settings.TTS_ENGINE.lower()
     language = getattr(settings, "TTS_LANGUAGE", "fr")
@@ -34,8 +34,14 @@ def build_tts_engine():
             logger.info("GoogleTTS initialized [language=%s]", language)
             return engine
         except Exception as exc:
-            logger.warning("GoogleTTS init failed: %s — falling back to silent stub", exc)
-            return _SilentTTS()
+            logger.critical(
+                "GoogleTTS initialization FAILED: %s\n"
+                "Install: pip install gtts sounddevice ffmpeg\n"
+                "System will continue but TTS output will be DISABLED.",
+                exc
+            )
+            # Create silent stub but log it as CRITICAL
+            return _SilentTTS(failed=True)
 
     elif tts_engine_name == "coqui":
         try:
@@ -52,12 +58,17 @@ def build_tts_engine():
             logger.info("CoquiTTS initialized [model=%s device=%s]", model_name, device)
             return engine
         except Exception as exc:
-            logger.warning("CoquiTTS init failed: %s — falling back to silent stub", exc)
-            return _SilentTTS()
+            logger.critical(
+                "CoquiTTS initialization FAILED: %s\n"
+                "Install: pip install tts torch\n"
+                "System will continue but TTS output will be DISABLED.",
+                exc
+            )
+            return _SilentTTS(failed=True)
 
     else:
         logger.warning("Unknown TTS engine '%s' — using silent stub", tts_engine_name)
-        return _SilentTTS()
+        return _SilentTTS(failed=False)
 
 
 def build_audio_priority_queue(tts_engine=None, state_manager=None):
@@ -107,9 +118,21 @@ class _SilentTTS:
     Used when audio dependencies are unavailable (e.g. CI, headless servers).
     """
 
+    def __init__(self, failed: bool = False):
+        """
+        Parameters
+        ----------
+        failed : bool
+            If True, this stub is due to a failed initialization.
+            If False, audio support was intentionally disabled.
+        """
+        self.failed = failed
+        if failed:
+            logger.critical("TTS engine is MUTED due to initialization failure — no audio output will be produced")
+
     def speak(self, text: str, interrupt_event=None) -> None:
         """Log text instead of speaking."""
-        logger.info("TTS (muted): %s", text)
+        logger.debug("TTS (muted): %s", text)
 
     def speak_async(self, text: str):
         """Fire-and-forget."""

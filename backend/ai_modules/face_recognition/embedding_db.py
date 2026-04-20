@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -49,6 +50,11 @@ class EmbeddingDB:
     """
     Persistent face embedding store backed by SQLite.
 
+    Thread-safe implementation:
+    - Write operations protected by a mutex lock
+    - Write-Ahead Logging (WAL) enabled for better concurrency
+    - Multiple readers can operate simultaneously
+
     Parameters
     ----------
     db_path : Path to .db file — created (with parent dirs) automatically.
@@ -57,14 +63,18 @@ class EmbeddingDB:
     def __init__(self, db_path: str | Path = _DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = threading.Lock()  # Protect write operations
         self._init_schema()
-        logger.debug("EmbeddingDB ready at %s", self.db_path)
+        logger.debug("EmbeddingDB ready at %s (thread-safe with WAL)", self.db_path)
 
     # ──────────────────────────── schema ──────────────────────────────────────
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # check_same_thread=False is safe now because writes are protected by _write_lock
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        # Enable Write-Ahead Logging for better concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def _init_schema(self) -> None:
@@ -82,6 +92,7 @@ class EmbeddingDB:
                 "CREATE INDEX IF NOT EXISTS idx_faces_name ON faces(name)"
             )
             conn.commit()
+            logger.debug("Database schema initialized")
 
     # ──────────────────────────── write ───────────────────────────────────────
 
@@ -94,35 +105,44 @@ class EmbeddingDB:
         """
         Store one embedding. Returns the new row id.
         The embedding is L2-normalised before storage.
+        Write operation is protected by a mutex lock for thread safety.
         """
         emb_norm = self._l2_normalise(embedding).astype(np.float32)
         now = datetime.now(timezone.utc).isoformat()
 
-        with self._connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO faces (name, relationship, embedding, enrolled_at) "
-                "VALUES (?, ?, ?, ?)",
-                (name, relationship, emb_norm.tobytes(), now),
-            )
-            conn.commit()
-
-        logger.debug("Stored embedding for '%s' (row %d).", name, cur.lastrowid)
-        return cur.lastrowid
+        with self._write_lock:  # Protect write operation
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO faces (name, relationship, embedding, enrolled_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (name, relationship, emb_norm.tobytes(), now),
+                )
+                conn.commit()
+            logger.debug("Stored embedding for '%s' (row %d).", name, cur.lastrowid)
+            return cur.lastrowid
 
     def delete_person(self, name: str) -> int:
-        """Delete all embeddings for `name`. Returns rows removed."""
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM faces WHERE name = ?", (name,))
-            conn.commit()
-        logger.info("Deleted %d embedding(s) for '%s'.", cur.rowcount, name)
-        return cur.rowcount
+        """
+        Delete all embeddings for `name`. Returns rows removed.
+        Write operation is protected by a mutex lock for thread safety.
+        """
+        with self._write_lock:  # Protect write operation
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM faces WHERE name = ?", (name,))
+                conn.commit()
+            logger.info("Deleted %d embedding(s) for '%s'.", cur.rowcount, name)
+            return cur.rowcount
 
     def clear(self) -> None:
-        """Wipe the entire table — use with care."""
-        with self._connect() as conn:
-            conn.execute("DELETE FROM faces")
-            conn.commit()
-        logger.warning("EmbeddingDB cleared.")
+        """
+        Wipe the entire table — use with care.
+        Write operation is protected by a mutex lock for thread safety.
+        """
+        with self._write_lock:  # Protect write operation
+            with self._connect() as conn:
+                conn.execute("DELETE FROM faces")
+                conn.commit()
+            logger.warning("EmbeddingDB cleared.")
 
     # ──────────────────────────── search ──────────────────────────────────────
 

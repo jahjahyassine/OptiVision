@@ -96,6 +96,7 @@ class InferenceService:
             return InferenceResult(camera_id=camera_id).to_dict()
 
         t_start = time.monotonic()
+        deadline = t_start + _INFERENCE_TIMEOUT_S
         errors: dict[str, str] = {}
 
         task_specs = [
@@ -107,7 +108,7 @@ class InferenceService:
 
         futures = []
 
-        for key, module, method, _default in task_specs:
+        for key, module, method, default in task_specs:
             if module is None:
                 continue
 
@@ -118,7 +119,7 @@ class InferenceService:
                 method,
                 frame
             )
-            futures.append((key, fut, _default))
+            futures.append((key, fut, default))
 
         results = {
             "faces": [],
@@ -127,21 +128,36 @@ class InferenceService:
             "depth": None,
         }
 
-        # ── SAFE COLLECT (NO TIMEOUT PER TASK) ───────────────────────────────
+        # ── HARD DEADLINE ENFORCEMENT ───────────────────────────────
         for key, fut, default in futures:
+            remaining = deadline - time.monotonic()
+
             try:
-                results[key] = fut.result()
+                if remaining <= 0:
+                    fut.cancel()
+                    results[key] = default
+                    errors[key] = "global timeout exceeded"
+                    continue
+
+                results[key] = fut.result(timeout=remaining)
+
+            except concurrent.futures.TimeoutError:
+                fut.cancel()
+                results[key] = default
+                errors[key] = f"timeout > {settings.INFERENCE_TIMEOUT_MS:.0f}ms"
+                logger.error("Module '%s' timed out", key)
+
             except Exception as exc:
                 results[key] = default
                 errors[key] = str(exc)
-                logger.error("Module '%s failed: %s", key, exc, exc_info=True)
+                logger.error("Module '%s' failed: %s", key, exc, exc_info=True)
 
         latency_ms = (time.monotonic() - t_start) * 1000
 
         if latency_ms > settings.INFERENCE_TIMEOUT_MS:
             logger.warning(
-                "Frame inference total=%.1f ms exceeded budget",
-                latency_ms
+                "Frame inference total=%.1f ms exceeded budget of %.1f ms",
+                latency_ms, settings.INFERENCE_TIMEOUT_MS
             )
 
         return InferenceResult(
@@ -205,6 +221,22 @@ def build_inference_service() -> InferenceService:
             model_name=settings.DEPTH_MODEL,
             device=settings.DEPTH_DEVICE,
         )
+
+    def _warmup(module, method: str):
+        """Run one blank inference so ONNX sessions are JIT-compiled."""
+        try:
+            blank = np.zeros((640, 640, 3), dtype=np.uint8)
+            getattr(module, method)(blank)
+            logger.info("%s warmed up.", module.__class__.__name__)
+        except Exception as exc:
+            logger.warning("Warmup failed for %s: %s", module.__class__.__name__, exc)
+
+    if face_recognizer:
+        _warmup(face_recognizer, "process")
+    if object_detector:
+        _warmup(object_detector, "detect")
+    if ocr_reader:
+        _warmup(ocr_reader, "read")
 
     return InferenceService(
         face_recognizer=face_recognizer,

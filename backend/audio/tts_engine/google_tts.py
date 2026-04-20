@@ -94,6 +94,13 @@ class GoogleTTS:
 
     # ─────────────────────────────── public API ───────────────────────────────
 
+    def is_ready(self) -> bool:
+        """
+        Check if all required dependencies are loaded and ready.
+        Returns False if TTS will be silent/non-functional.
+        """
+        return self._gtts_mod is not None and self._ffmpeg is not None and self._sd is not None
+
     def speak(
         self,
         text: str,
@@ -112,6 +119,16 @@ class GoogleTTS:
                           higher-priority alert arrives; causes early exit.
         """
         if not text or not text.strip():
+            return
+
+        if not self.is_ready():
+            logger.error(
+                "GoogleTTS: speak() called but TTS is not ready — check dependencies: "
+                "gTTS=%s, ffmpeg=%s, sounddevice=%s",
+                self._gtts_mod is not None,
+                self._ffmpeg is not None,
+                self._sd is not None,
+            )
             return
 
         if interrupt_event and interrupt_event.is_set():
@@ -171,10 +188,11 @@ class GoogleTTS:
                 "GoogleTTS: gTTS loaded (lang=%s, tld=%s, slow=%s).",
                 self._lang, self._tld, self._slow,
             )
-        except ImportError:
+        except ImportError as exc:
             logger.error(
-                "gTTS not installed — run: pip install gtts\n"
-                "AudioPriorityQueue will start but TTS output will be silent."
+                "GoogleTTS FAILED: gTTS not installed — run: pip install gtts\n"
+                "Audio output will be DISABLED.",
+                exc_info=True
             )
 
         # ── ffmpeg (MP3 → raw PCM via subprocess) ─────────────────────────────
@@ -184,8 +202,9 @@ class GoogleTTS:
             logger.info("GoogleTTS: ffmpeg found at %s — MP3 decoding ready.", ffmpeg_path)
         else:
             logger.error(
-                "ffmpeg not found in PATH — MP3 decoding will fail.\n"
-                "Install: sudo pacman -S ffmpeg  |  sudo apt install ffmpeg"
+                "GoogleTTS FAILED: ffmpeg not found in PATH — MP3 decoding will fail.\n"
+                "Install: sudo pacman -S ffmpeg  |  sudo apt install ffmpeg\n"
+                "Audio output will be DISABLED."
             )
 
         # ── sounddevice ───────────────────────────────────────────────────────
@@ -193,10 +212,11 @@ class GoogleTTS:
             import sounddevice as sd  # type: ignore
             self._sd = sd
             logger.info("GoogleTTS: sounddevice loaded — audio output ready.")
-        except ImportError:
-            logger.warning(
-                "sounddevice not installed — run: pip install sounddevice\n"
-                "Synthesis will run but audio will not play."
+        except ImportError as exc:
+            logger.error(
+                "GoogleTTS FAILED: sounddevice not installed — run: pip install sounddevice\n"
+                "Audio output will be DISABLED.",
+                exc_info=True
             )
 
     def _synthesise(self, text: str) -> Optional[np.ndarray]:
@@ -233,6 +253,7 @@ class GoogleTTS:
         # ── ffmpeg: MP3 → signed 16-bit little-endian PCM at _SAMPLE_RATE ─────
         #   stdin  : raw MP3 bytes
         #   stdout : raw s16le PCM at target sample rate, 1 channel
+        #   timeout: 2 seconds (conservative for real-time audio pipelines)
         cmd = [
             self._ffmpeg,
             "-hide_banner", "-loglevel", "error",
@@ -247,7 +268,7 @@ class GoogleTTS:
                 cmd,
                 input=mp3_bytes,
                 capture_output=True,
-                timeout=10,
+                timeout=2.0,  # Reduced from 10s to 2s for real-time requirements
             )
             if result.returncode != 0:
                 logger.error(
@@ -257,7 +278,10 @@ class GoogleTTS:
                 return None
             pcm_bytes = result.stdout
         except subprocess.TimeoutExpired:
-            logger.error("GoogleTTS ffmpeg decode timed out.")
+            logger.error(
+                "GoogleTTS ffmpeg decode timed out after 2s — this blocks the TTS worker thread. "
+                "Check ffmpeg installation or system load."
+            )
             return None
         except Exception as exc:
             logger.error("GoogleTTS ffmpeg subprocess failed: %s", exc, exc_info=True)
@@ -313,7 +337,7 @@ class GoogleTTS:
         every _CHUNK_MS milliseconds — identical logic to CoquiTTS._play.
         """
         if self._sd is None:
-            logger.warning("GoogleTTS: sounddevice unavailable — skipping playback.")
+            logger.error("GoogleTTS: sounddevice unavailable — cannot play audio.")
             return
 
         sd = self._sd

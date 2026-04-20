@@ -10,12 +10,14 @@ Design choices:
 - Returns (dropped: bool) from put() so callers can track drop rate.
 - Exposes a stats dict for /health endpoint monitoring.
 - Shutdown sentinels let WorkerPool signal threads to exit gracefully.
+- Counter operations protected by mutex for thread safety.
 """
 
 from __future__ import annotations
 
 import logging
 import queue
+import threading
 from typing import Optional
 
 import numpy as np
@@ -38,6 +40,7 @@ class FrameQueue:
 
     def __init__(self, maxsize: int = 30) -> None:
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._lock = threading.Lock()  # Protect counter operations
         self._total_received  = 0
         self._total_dropped   = 0
         self._total_processed = 0
@@ -54,13 +57,15 @@ class FrameQueue:
             True  — an old frame was dropped to make room.
             False — frame was enqueued without dropping anything.
         """
-        self._total_received += 1
+        with self._lock:
+            self._total_received += 1
         dropped = False
 
         if self._q.full():
             try:
                 self._q.get_nowait()  # discard oldest
-                self._total_dropped += 1
+                with self._lock:
+                    self._total_dropped += 1
                 dropped = True
                 logger.debug("FrameQueue full — oldest frame discarded (drop #%d)",
                              self._total_dropped)
@@ -72,7 +77,8 @@ class FrameQueue:
         except queue.Full:
             # Extremely rare race condition; log and move on
             logger.warning("FrameQueue put_nowait failed despite drop — frame lost")
-            self._total_dropped += 1
+            with self._lock:
+                self._total_dropped += 1
             dropped = True
 
         return dropped
@@ -102,7 +108,8 @@ class FrameQueue:
         """Signal that a retrieved frame has been fully processed."""
         try:
             self._q.task_done()
-            self._total_processed += 1
+            with self._lock:
+                self._total_processed += 1
         except ValueError:
             pass  # called more times than items retrieved — ignore
 
@@ -119,16 +126,23 @@ class FrameQueue:
 
     @property
     def stats(self) -> dict:
+        with self._lock:
+            received = self._total_received
+            dropped = self._total_dropped
+            processed = self._total_processed
+        
+        drop_rate = (
+            round(dropped / received, 3)
+            if received
+            else 0.0
+        )
+        
         return {
             "size":            self._q.qsize(),
-            "total_received":  self._total_received,
-            "total_dropped":   self._total_dropped,
-            "total_processed": self._total_processed,
-            "drop_rate": (
-                round(self._total_dropped / self._total_received, 3)
-                if self._total_received
-                else 0.0
-            ),
+            "total_received":  received,
+            "total_dropped":   dropped,
+            "total_processed": processed,
+            "drop_rate":       drop_rate,
         }
 
     # ── shutdown signalling ───────────────────────────────────────────────────

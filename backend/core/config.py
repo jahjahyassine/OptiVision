@@ -43,7 +43,7 @@ try:
         FRAME_MAX_HEIGHT: int  = 480
 
         # Inference timing (real-time control)
-        INFERENCE_TIMEOUT_MS: int = 300
+        INFERENCE_TIMEOUT_MS: int = 1500
 
         # Face Recognition
         FACE_MODEL: str                  = "buffalo_l"
@@ -91,6 +91,29 @@ try:
 
 except ImportError:
     import json
+    from pathlib import Path
+
+    # Load .env file if available
+    try:
+        from dotenv import load_dotenv
+        _env_file = _BACKEND_DIR / ".env"
+        if _env_file.exists():
+            load_dotenv(_env_file)
+            print(f"Loaded environment from {_env_file}")
+    except ImportError:
+        # dotenv not available — try manual .env parsing
+        _env_file = _BACKEND_DIR / ".env"
+        if _env_file.exists():
+            try:
+                with open(_env_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, val = line.split("=", 1)
+                            os.environ[key.strip()] = val.strip()
+                print(f"Parsed environment from {_env_file}")
+            except Exception as e:
+                print(f"Warning: Could not parse .env file: {e}")
 
     class Settings:  # type: ignore[no-redef]
         HOST: str      = os.getenv("HOST", "0.0.0.0")
@@ -120,7 +143,7 @@ except ImportError:
         )
         YOLO_CONFIDENCE: float = float(os.getenv("YOLO_CONFIDENCE", "0.45"))
         YOLO_IMG_SIZE: int     = int(os.getenv("YOLO_IMG_SIZE", "416"))
-        YOLO_DEVICE: str       = os.getenv("YOLO_DEVICE", "cuda")
+        YOLO_DEVICE: str       = os.getenv("YOLO_DEVICE", "cpu")
 
         OCR_LANGUAGES: list             = json.loads(os.getenv("OCR_LANGUAGES", '["fr","en"]'))
         OCR_GPU: bool                   = os.getenv("OCR_GPU", "false").lower() == "true"
@@ -128,7 +151,7 @@ except ImportError:
 
         DEPTH_ENABLED: bool  = os.getenv("DEPTH_ENABLED", "true").lower() == "true"
         DEPTH_MODEL: str     = os.getenv("DEPTH_MODEL", "MiDaS_small")
-        DEPTH_DEVICE: str    = os.getenv("DEPTH_DEVICE", "cuda")
+        DEPTH_DEVICE: str    = os.getenv("DEPTH_DEVICE", "cpu")
 
         DECISION_CONFIDENCE_THRESHOLD: float = float(
             os.getenv("DECISION_CONFIDENCE_THRESHOLD", "0.5")
@@ -142,7 +165,7 @@ except ImportError:
         TTS_RATE_LIMIT_SECS: float = float(os.getenv("TTS_RATE_LIMIT_SECS", "3.0"))
         AUDIO_QUEUE_MAX: int       = int(os.getenv("AUDIO_QUEUE_MAX", "20"))
 
-        INFERENCE_TIMEOUT_MS: int = int(os.getenv("INFERENCE_TIMEOUT_MS", "300"))
+        INFERENCE_TIMEOUT_MS: int = int(os.getenv("INFERENCE_TIMEOUT_MS", "1500"))
 
 
 settings = Settings()
