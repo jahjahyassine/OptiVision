@@ -43,7 +43,7 @@ try:
         FRAME_MAX_HEIGHT: int  = 480
 
         # Inference timing (real-time control)
-        INFERENCE_TIMEOUT_MS: int = 30
+        INFERENCE_TIMEOUT_MS: int = 300
 
         # Face Recognition
         FACE_MODEL: str                  = "buffalo_l"
@@ -60,7 +60,7 @@ try:
         )
         YOLO_CONFIDENCE: float  = 0.45
         YOLO_IMG_SIZE: int      = 416
-        YOLO_DEVICE: str        = "cuda"
+        YOLO_DEVICE: str        = "cpu"
 
         # OCR
         OCR_LANGUAGES: list     = Field(default=["fr", "en"])
@@ -70,15 +70,12 @@ try:
         # Depth Estimation
         DEPTH_ENABLED: bool  = True
         DEPTH_MODEL: str     = "MiDaS_small"
-        DEPTH_DEVICE: str    = "cuda"
+        DEPTH_DEVICE: str    = "cpu"
 
         # Decision Engine
         DECISION_CONFIDENCE_THRESHOLD: float = 0.5
         DECISION_IDENTITY_PRIORITY: bool     = True
 
-        # Performance / real-time constraints
-        MAX_INFERENCE_LATENCY_MS: int = 150
-        ENABLE_REALTIME_DROPPING: bool = True
 
 
         # Audio / TTS
@@ -144,6 +141,8 @@ except ImportError:
         TTS_LANGUAGE: str          = os.getenv("TTS_LANGUAGE", "fr")
         TTS_RATE_LIMIT_SECS: float = float(os.getenv("TTS_RATE_LIMIT_SECS", "3.0"))
         AUDIO_QUEUE_MAX: int       = int(os.getenv("AUDIO_QUEUE_MAX", "20"))
+
+        INFERENCE_TIMEOUT_MS: int = int(os.getenv("INFERENCE_TIMEOUT_MS", "300"))
 
 
 settings = Settings()
